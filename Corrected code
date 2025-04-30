@@ -1,0 +1,126 @@
+# Import necessary libraries
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Subset
+import os
+
+# Set device and seed
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.manual_seed(42)
+
+# Loads data set 
+def load_dataset():
+    transform = transforms.Compose([
+        transforms.ToTensor(),  # Convert images to tensors
+    ])
+    full_dataset = datasets.CIFAR10(
+        root='./data',
+        train=True,
+        download=True,
+        transform=transform
+    )
+    return full_dataset
+
+#Shard the dataset into disjoint subsets
+def shard_dataset(full_dataset, num_shards=5):
+    shard_size = len(full_dataset) // num_shards
+    shards = [
+        Subset(full_dataset, range(i * shard_size, (i + 1) * shard_size))
+        for i in range(num_shards)
+    ]
+    return shards
+
+#Define a simple CNN model architecture
+class SimpleCNN(nn.Module):
+    def __init__(self):
+        super(SimpleCNN, self).__init__()
+        self.conv1 = nn.Conv2d(3, 6, kernel_size=5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.fc = nn.Linear(6 * 14 * 14, 10)
+
+    def forward(self, x):
+        x = self.pool(torch.relu(self.conv1(x)))
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+#Train submodels on each shard
+def train_submodels(shards, num_epochs=5):
+    submodels = []
+    for idx, shard in enumerate(shards):
+        print(f"Training submodel on shard {idx + 1}/{len(shards)}")
+        model = SimpleCNN().to(device)
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        criterion = nn.CrossEntropyLoss()
+        loader = DataLoader(shard, batch_size=64, shuffle=True, num_workers=0)
+
+        for epoch in range(num_epochs):
+            for X, y in loader:
+                X, y = X.to(device), y.to(device)
+                optimizer.zero_grad()
+                outputs = model(X)
+                loss = criterion(outputs, y)
+                loss.backward()
+                optimizer.step()
+
+        submodels.append(model)
+    return submodels
+
+#Unlearn data by retraining only the affected shard
+def unlearn_data(submodels, shards, shard_idx_to_unlearn, num_epochs=5):
+    print(f"Unlearning data in shard {shard_idx_to_unlearn}")
+
+    original_shard = shards[shard_idx_to_unlearn]
+    new_indices = list(range(len(original_shard) - 100))
+    new_shard = Subset(original_shard, new_indices)
+
+    model = SimpleCNN().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.CrossEntropyLoss()
+    loader = DataLoader(new_shard, batch_size=64, shuffle=True, num_workers=0)
+
+    for epoch in range(num_epochs):
+        for X, y in loader:
+            X, y = X.to(device), y.to(device)
+            optimizer.zero_grad()
+            outputs = model(X)
+            loss = criterion(outputs, y)
+            loss.backward()
+            optimizer.step()
+
+    submodels[shard_idx_to_unlearn] = model
+    return submodels
+
+#Aggregate predictions from all submodels
+def ensemble_predict(submodels, X):
+    votes = torch.zeros(10).to(device)
+    X = X.to(device)
+    for model in submodels:
+        model.eval()
+        with torch.no_grad():
+            outputs = model(X)
+            predicted_class = torch.argmax(outputs).item()
+            votes[predicted_class] += 1
+    return torch.argmax(votes).item()
+
+# --------------------------
+# Main Execution HELLLLLLL
+# --------------------------
+if __name__ == "__main__":
+    full_dataset = load_dataset()
+    shards = shard_dataset(full_dataset, num_shards=5)
+    submodels = train_submodels(shards)
+
+    # Get a sample image
+    test_image, test_label = full_dataset[0]
+    prediction = ensemble_predict(submodels, test_image.unsqueeze(0))
+    print(f"Initial prediction: {prediction}, True label: {test_label}")
+
+    # Unlearn part of shard 2
+    submodels = unlearn_data(submodels, shards, shard_idx_to_unlearn=2)
+
+    # Post-unlearning test
+    new_prediction = ensemble_predict(submodels, test_image.unsqueeze(0))
+    print(f"Post-unlearning prediction: {new_prediction}, True label: {test_label}")
